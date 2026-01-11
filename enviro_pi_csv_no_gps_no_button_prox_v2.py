@@ -126,7 +126,7 @@ def update_display_status(display_ctx, is_recording: bool):
     draw.rectangle((0, 0, width, height), (0, 0, 0))
     status = "RECORDING" if is_recording else "IDLE"
     status_color = (0, 255, 0) if is_recording else (255, 0, 0)
-    draw.text((0, 0), "STATUS", font=font, fill=(255, 255, 255))
+    draw.text((0, 0), "READY", font=font, fill=(255, 255, 255))
     draw.text((0, 26), status, font=font, fill=status_color)
     display.display(img)
 
