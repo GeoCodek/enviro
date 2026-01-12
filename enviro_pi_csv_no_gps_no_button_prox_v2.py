@@ -185,7 +185,40 @@ class Recorder:
     def start(self):
         if self.is_recording:
             return
-@@ -151,149 +222,170 @@ def read_all(env_noise, bme):
+        self.path = new_csv_path(self.data_dir)
+        self.fp = open(self.path, "w", newline="")
+        self.writer = csv.writer(self.fp)
+        self.writer.writerow(CSV_HEADER)
+        self.fp.flush()
+        print(f"[{now_iso_seconds()}] RECORDING STARTED -> {self.path}")
+
+    def stop(self):
+        if not self.is_recording:
+            return
+        try:
+            self.fp.flush()
+            self.fp.close()
+        finally:
+            print(f"[{now_iso_seconds()}] RECORDING STOPPED -> {self.path}")
+            self.fp = None
+            self.writer = None
+            self.path = None
+
+    def write_row(self, row):
+        if not self.is_recording:
+            return
+        self.writer.writerow(row)
+        self.fp.flush()
+
+
+def read_all(env_noise, bme):
+    # Light/proximity
+    try:
+        lux = ltr559.get_lux()
+    except Exception:
+        lux = ""
+
+    try:
         prox = ltr559.get_proximity()
     except Exception:
         prox = ""
