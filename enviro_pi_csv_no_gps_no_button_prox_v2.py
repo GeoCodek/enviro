@@ -51,7 +51,7 @@ def _record_flag_file(script_dir: str) -> str:
     return os.path.join(script_dir, "RECORD")
 
 
-# Tuning parameters
+# --------- Tuning parameters ---------
 SAMPLE_INTERVAL_S = 5.0
 
 # Proximity gesture detection: "3 detections within 10 seconds"
@@ -64,7 +64,7 @@ PROX_OFF = 150  # considered "far" again once dropping below this
 
 # Temperature compensation factor (from Enviro+ examples)
 TEMP_COMP_FACTOR = 2.25
-# Tuning Parameters
+# -------------------------------------
 
 
 def now_iso_seconds() -> str:
@@ -209,7 +209,8 @@ class Recorder:
     def start(self):
         if self.is_recording:
             return
-    prox = ltr559.get_proximity()
+    
+        prox = ltr559.get_proximity()
     except Exception:
         prox = ""
 
@@ -388,3 +389,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+         
