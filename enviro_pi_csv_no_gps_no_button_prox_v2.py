@@ -38,19 +38,6 @@ try:
 except ImportError:
     st7735 = None
 
-try:
-    # Transitional fix for breaking change in LTR559
-    from ltr559 import LTR559
-    ltr559 = LTR559()
-except ImportError:
-    import ltr559
-try:
-    import st7735
-    from fonts.ttf import RobotoMedium as UserFont
-    from PIL import Image, ImageDraw, ImageFont
-except ImportError:
-    st7735 = None
-
 
 def _truthy_env(name: str) -> bool:
     v = os.environ.get(name, "")
@@ -70,11 +57,6 @@ GESTURE_WINDOW_S = 10.0
 GESTURE_COUNT = 3
 
 # Proximity thresholds (hysteresis). Adjust if needed.
-
-# Your logs showed proximity values like 0 and spikes like ~600+ when a hand is near.
-PROX_ON = 200   # counts as "near" when rising above this
-PROX_OFF = 100  # considered "far" again once dropping below this
-
 PROX_ON = 500   # counts as "near" when rising above this
 PROX_OFF = 150  # considered "far" again once dropping below this
 
