@@ -11,6 +11,7 @@ Control:
 Notes:
 - Particulate sensor (PMS5003) is intentionally not used here to avoid blocking reads when not attached.
 - Designed to run inside Pimoroni's recommended venv: source ~/.virtualenvs/pimoroni/bin/activate
+- If an ST7735 LCD is available, the display shows the current recording status.
 """
 
 import csv
@@ -23,6 +24,20 @@ from enviroplus import gas, noise
 from smbus2 import SMBus
 from bme280 import BME280
 import ltr559
+
+try:
+    # Transitional fix for breaking change in LTR559
+    from ltr559 import LTR559
+    ltr559 = LTR559()
+except ImportError:
+    import ltr559
+
+try:
+    import st7735
+    from fonts.ttf import RobotoMedium as UserFont
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    st7735 = None
 
 
 def _truthy_env(name: str) -> bool:
@@ -46,6 +61,11 @@ GESTURE_COUNT = 3
 # Your logs showed proximity values like 0 and spikes like ~600+ when a hand is near.
 PROX_ON = 200   # counts as "near" when rising above this
 PROX_OFF = 100  # considered "far" again once dropping below this
+PROX_ON = 500   # counts as "near" when rising above this
+PROX_OFF = 150  # considered "far" again once dropping below this
+
+# Temperature compensation factor (from Enviro+ examples)
+TEMP_COMP_FACTOR = 2.25
 # -------------------------------------
 
 
@@ -60,6 +80,59 @@ def safe_float(x):
         return float(x)
     except Exception:
         return ""
+
+
+def get_cpu_temperature():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            temp = f.read()
+            return int(temp) / 1000.0
+    except Exception:
+        return ""
+
+
+def init_display():
+    if st7735 is None:
+        return None
+    display = st7735.ST7735(
+        port=0,
+        cs=1,
+        dc="GPIO9",
+        backlight="GPIO12",
+        rotation=270,
+        spi_speed_hz=10000000,
+    )
+    display.begin()
+    width = display.width
+    height = display.height
+    img = Image.new("RGB", (width, height), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(UserFont, 20)
+    return {
+        "display": display,
+        "width": width,
+        "height": height,
+        "img": img,
+        "draw": draw,
+        "font": font,
+    }
+
+
+def update_display_status(display_ctx, is_recording: bool):
+    if not display_ctx:
+        return
+    draw = display_ctx["draw"]
+    img = display_ctx["img"]
+    width = display_ctx["width"]
+    height = display_ctx["height"]
+    font = display_ctx["font"]
+    display = display_ctx["display"]
+    draw.rectangle((0, 0, width, height), (0, 0, 0))
+    status = "RECORDING" if is_recording else "IDLE"
+    status_color = (0, 255, 0) if is_recording else (255, 0, 0)
+    draw.text((0, 0), "READY", font=font, fill=(255, 255, 255))
+    draw.text((0, 26), status, font=font, fill=status_color)
+    display.display(img)
 
 
 def init_sensors():
@@ -89,6 +162,8 @@ CSV_HEADER = [
     "humidity_percent",
     "pressure_hPa",
     "altitude_m",
+    "cpu_temperature_C",
+    "temperature_compensated_C",
     "gas_oxidising_ohms",
     "gas_reducing_ohms",
     "gas_nh3_ohms",
@@ -114,40 +189,7 @@ class Recorder:
     def start(self):
         if self.is_recording:
             return
-        self.path = new_csv_path(self.data_dir)
-        self.fp = open(self.path, "w", newline="")
-        self.writer = csv.writer(self.fp)
-        self.writer.writerow(CSV_HEADER)
-        self.fp.flush()
-        print(f"[{now_iso_seconds()}] RECORDING STARTED -> {self.path}")
-
-    def stop(self):
-        if not self.is_recording:
-            return
-        try:
-            self.fp.flush()
-            self.fp.close()
-        finally:
-            print(f"[{now_iso_seconds()}] RECORDING STOPPED -> {self.path}")
-            self.fp = None
-            self.writer = None
-            self.path = None
-
-    def write_row(self, row):
-        if not self.is_recording:
-            return
-        self.writer.writerow(row)
-        self.fp.flush()
-
-
-def read_all(env_noise, bme):
-    # Light/proximity
-    try:
-        lux = ltr559.get_lux()
-    except Exception:
-        lux = ""
-
-    try:
+@@ -151,149 +222,170 @@ def read_all(env_noise, bme):
         prox = ltr559.get_proximity()
     except Exception:
         prox = ""
@@ -172,6 +214,13 @@ def read_all(env_noise, bme):
         alt = bme.get_altitude()
     except Exception:
         alt = ""
+
+    # CPU temperature for compensation (if available)
+    cpu_temp = get_cpu_temperature()
+    if temp != "" and cpu_temp != "":
+        temp_comp = temp - ((cpu_temp - temp) / TEMP_COMP_FACTOR)
+    else:
+        temp_comp = ""
 
     # Gas (resistance-like values)
     try:
@@ -198,6 +247,8 @@ def read_all(env_noise, bme):
         "hum": hum,
         "pres": pres,
         "alt": alt,
+        "cpu_temp": cpu_temp,
+        "temp_comp": temp_comp,
         "ox": ox,
         "red": red,
         "nh3": nh3,
@@ -213,6 +264,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = ensure_data_dir(script_dir)
     env_noise, bme = init_sensors()
+    display_ctx = init_display()
 
     recorder = Recorder(data_dir)
 
@@ -221,6 +273,7 @@ def main():
     close_state = False  # hysteresis state
 
     next_sample = time.time()
+    last_status = None
 
     print(f"[{now_iso_seconds()}] Ready. Gesture: {GESTURE_COUNT} proximity detections within {GESTURE_WINDOW_S}s toggles recording.")
     print(f"[{now_iso_seconds()}] Data directory: {data_dir}")
@@ -231,6 +284,9 @@ def main():
     if _truthy_env("RECORD_ON_START") or os.path.exists(_record_flag_file(script_dir)):
         recorder.start()
 
+    last_status = recorder.is_recording
+    print(f"[{now_iso_seconds()}] STATUS: {'RECORDING' if last_status else 'IDLE'}")
+    update_display_status(display_ctx, last_status)
 
     try:
         while True:
@@ -260,6 +316,11 @@ def main():
                             recorder.start()
                         time.sleep(0.5)
 
+            if last_status != recorder.is_recording:
+                last_status = recorder.is_recording
+                print(f"[{now_iso_seconds()}] STATUS: {'RECORDING' if last_status else 'IDLE'}")
+                update_display_status(display_ctx, last_status)
+
             # If recording, write sensor sample at fixed interval
             now = time.time()
             if recorder.is_recording and now >= next_sample:
@@ -273,6 +334,8 @@ def main():
                     safe_float(s["hum"]),
                     safe_float(s["pres"]),
                     safe_float(s["alt"]),
+                    safe_float(s["cpu_temp"]),
+                    safe_float(s["temp_comp"]),
                     safe_float(s["ox"]),
                     safe_float(s["red"]),
                     safe_float(s["nh3"]),
