@@ -209,7 +209,7 @@ class Recorder:
     def start(self):
         if self.is_recording:
             return
-   prox = ltr559.get_proximity()
+    prox = ltr559.get_proximity()
     except Exception:
         prox = ""
 
