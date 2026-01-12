@@ -16,6 +16,8 @@ Notes:
 
 import csv
 import os
+import subprocess
+import sys
 import time
 from collections import deque
 from datetime import datetime
@@ -149,6 +151,28 @@ def new_csv_path(data_dir: str) -> str:
     return os.path.join(data_dir, f"enviro_log_{ts}.csv")
 
 
+def start_shutdown_watcher(script_path: str, proc):
+    if proc is not None:
+        return proc
+    if not os.path.exists(script_path):
+        print(f"[{now_iso_seconds()}] Shutdown watcher script not found at {script_path}")
+        return None
+    print(f"[{now_iso_seconds()}] Starting shutdown watcher.")
+    return subprocess.Popen([sys.executable, script_path])
+
+
+def stop_shutdown_watcher(proc):
+    if proc is None:
+        return None
+    print(f"[{now_iso_seconds()}] Stopping shutdown watcher.")
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+    return None
+
+
 CSV_HEADER = [
     "timestamp_iso",
     "unix_time_s",
@@ -185,41 +209,7 @@ class Recorder:
     def start(self):
         if self.is_recording:
             return
-        self.path = new_csv_path(self.data_dir)
-        self.fp = open(self.path, "w", newline="")
-        self.writer = csv.writer(self.fp)
-        self.writer.writerow(CSV_HEADER)
-        self.fp.flush()
-        print(f"[{now_iso_seconds()}] RECORDING STARTED -> {self.path}")
-
-    def stop(self):
-        if not self.is_recording:
-            return
-        try:
-            self.fp.flush()
-            self.fp.close()
-        finally:
-            print(f"[{now_iso_seconds()}] RECORDING STOPPED -> {self.path}")
-            self.fp = None
-            self.writer = None
-            self.path = None
-
-    def write_row(self, row):
-        if not self.is_recording:
-            return
-        self.writer.writerow(row)
-        self.fp.flush()
-
-
-def read_all(env_noise, bme):
-    # Light/proximity
-    try:
-        lux = ltr559.get_lux()
-    except Exception:
-        lux = ""
-
-    try:
-        prox = ltr559.get_proximity()
+   prox = ltr559.get_proximity()
     except Exception:
         prox = ""
 
@@ -294,6 +284,8 @@ def main():
     data_dir = ensure_data_dir(script_dir)
     env_noise, bme = init_sensors()
     display_ctx = init_display()
+    shutdown_script = os.path.join(script_dir, "enviro_pi_shutdown_gesture.py")
+    shutdown_proc = None
 
     recorder = Recorder(data_dir)
 
@@ -312,6 +304,8 @@ def main():
     # - OR create a file named 'RECORD' in the script directory
     if _truthy_env("RECORD_ON_START") or os.path.exists(_record_flag_file(script_dir)):
         recorder.start()
+    else:
+        shutdown_proc = start_shutdown_watcher(shutdown_script, shutdown_proc)
 
     last_status = recorder.is_recording
     print(f"[{now_iso_seconds()}] STATUS: {'RECORDING' if last_status else 'IDLE'}")
@@ -349,6 +343,10 @@ def main():
                 last_status = recorder.is_recording
                 print(f"[{now_iso_seconds()}] STATUS: {'RECORDING' if last_status else 'IDLE'}")
                 update_display_status(display_ctx, last_status)
+                if last_status:
+                    shutdown_proc = stop_shutdown_watcher(shutdown_proc)
+                else:
+                    shutdown_proc = start_shutdown_watcher(shutdown_script, shutdown_proc)
 
             # If recording, write sensor sample at fixed interval
             now = time.time()
@@ -384,6 +382,7 @@ def main():
         pass
     finally:
         recorder.stop()
+        shutdown_proc = stop_shutdown_watcher(shutdown_proc)
         print(f"[{now_iso_seconds()}] Exited.")
 
 
