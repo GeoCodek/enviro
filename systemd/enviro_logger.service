@@ -1,0 +1,14 @@
+[Unit]
+Description=Enviro+ proximity logger
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/envy/enviro
+ExecStart=/usr/bin/python3 /home/envy/enviro/enviro_pi_csv_no_gps_no_button_prox_v2.py
+Restart=on-failure
+User=envy
+Group=envy
+
+[Install]
+WantedBy=multi-user.target
