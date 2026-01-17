@@ -4,11 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/pi/enviro
-ExecStart=/usr/bin/python3 /home/pi/enviro/enviro_pi_csv_no_gps_no_button_prox_v2.py
+WorkingDirectory=/home/envy/enviro
+ExecStart=/usr/bin/python3 /home/envy/enviro/enviro_pi_csv_no_gps_no_button_prox_v2.py
 Restart=on-failure
-User=pi
-Group=pi
+User=envy
+Group=envy
 
 [Install]
 WantedBy=multi-user.target
