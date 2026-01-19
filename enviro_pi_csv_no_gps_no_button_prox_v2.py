@@ -1,4 +1,5 @@
-
+#!/usr/bin/env python3
+"""
 Notes:
 - Particulate sensor (PMS5003) is intentionally not used here to avoid blocking reads when not attached.
 - Designed to run inside Pimoroni's recommended venv: source ~/.virtualenvs/pimoroni/bin/activate
