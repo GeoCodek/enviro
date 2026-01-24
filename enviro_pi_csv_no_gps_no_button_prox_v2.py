@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 Enviro+ logger with GPS via gpsd (/dev/ttyACM0), proximity gesture toggle, and optional shutdown-watcher.
