@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Enviro+ logger (no GPS, no button)
+Enviro+ logger with GPS (UART NMEA), proximity gesture toggle, and optional shutdown-watcher.
 
 Control:
-- Make 3 distinct "hand near" proximity events within 10 seconds to TOGGLE recording:
+- Make 3 distinct "hand near" proximity events within 10 seconds to TOGGLE recording.
 - Optional bypass: start recording immediately by setting RECORD_ON_START=1 when launching
   (or create a file named RECORD in the script directory).
   * If not recording: start logging to a new CSV file (with headers)
   * If recording: stop logging (close the CSV file)
+
+GPS:
+- Reads raw NMEA from /dev/serial0 at 9600 baud (typical for GT-U7/NEO).
+- gpsd is proactively stopped to avoid UART contention.
+- Robust parsing: tolerates NO FIX, partial lines, and garbage bytes.
 
 Notes:
 - Designed to run inside Pimoroni's recommended venv: source ~/.virtualenvs/pimoroni/bin/activate
@@ -23,6 +28,8 @@ import sys
 import time
 from collections import deque
 from datetime import datetime
+
+import serial  # pyserial
 
 from enviroplus import gas, noise
 from smbus2 import SMBus
@@ -55,7 +62,6 @@ def _truthy_env(name: str) -> bool:
 
 
 def _record_flag_file(script_dir: str) -> str:
-    # If this file exists, recording starts immediately.
     return os.path.join(script_dir, "RECORD")
 
 
@@ -72,6 +78,11 @@ PROX_OFF = 150  # considered "far" again once dropping below this
 
 # Temperature compensation factor (from Enviro+ examples)
 TEMP_COMP_FACTOR = 2.25
+
+# GPS (UART)
+GPS_PORT = "/dev/serial0"
+GPS_BAUD = 9600
+GPS_READ_TIMEOUT_S = 1.0
 # -------------------------------------
 
 
@@ -84,6 +95,25 @@ def safe_float(x):
         if x is None or x == "":
             return ""
         return float(x)
+    except Exception:
+        return ""
+
+
+def safe_int(x):
+    try:
+        if x is None or x == "":
+            return ""
+        return int(x)
+    except Exception:
+        return ""
+
+
+def safe_str(x):
+    if x is None:
+        return ""
+    try:
+        s = str(x)
+        return s
     except Exception:
         return ""
 
@@ -189,9 +219,181 @@ def stop_shutdown_watcher(proc):
     return None
 
 
+def nmea_checksum_ok(sentence: str) -> bool:
+    # sentence includes leading '$' and contains '*hh'
+    try:
+        if not sentence.startswith("$") or "*" not in sentence:
+            return False
+        body, cks = sentence[1:].split("*", 1)
+        cks = cks.strip()
+        if len(cks) < 2:
+            return False
+        want = int(cks[:2], 16)
+        got = 0
+        for ch in body:
+            got ^= ord(ch)
+        return got == want
+    except Exception:
+        return False
+
+
+def nmea_dm_to_deg(dm: str, hemi: str):
+    # dm like "ddmm.mmmm" or "dddmm.mmmm"
+    try:
+        if dm is None or dm == "":
+            return None
+        if "." not in dm:
+            return None
+        # minutes are last two digits of the integer part (before decimal) plus fractional
+        # so split degrees/minutes by length: degrees = all but last 2 of integer part
+        ip = dm.split(".", 1)[0]
+        if len(ip) < 3:
+            return None
+        deg_part = ip[:-2]
+        min_part = dm[len(deg_part):]
+        deg = float(deg_part)
+        minutes = float(min_part)
+        val = deg + minutes / 60.0
+        if hemi in ("S", "W"):
+            val = -val
+        return val
+    except Exception:
+        return None
+
+
+def parse_gga(parts):
+    # $GPGGA,time,lat,N,lon,E,fix,numsats,hdop,alt,M,geoid,M,...
+    out = {}
+    try:
+        fix_q = parts[6] if len(parts) > 6 else ""
+        sats = parts[7] if len(parts) > 7 else ""
+        hdop = parts[8] if len(parts) > 8 else ""
+        alt = parts[9] if len(parts) > 9 else ""
+        out["fix_quality"] = int(fix_q) if fix_q.isdigit() else None
+        out["num_sats"] = int(sats) if sats.isdigit() else None
+        out["hdop"] = float(hdop) if hdop not in ("", None) else None
+        out["alt_m"] = float(alt) if alt not in ("", None) else None
+    except Exception:
+        pass
+    return out
+
+
+def parse_rmc(parts):
+    # $GPRMC,time,status,lat,N,lon,E,speed_knots,course,date,...
+    out = {}
+    try:
+        status = parts[2] if len(parts) > 2 else ""
+        lat = parts[3] if len(parts) > 3 else ""
+        lat_h = parts[4] if len(parts) > 4 else ""
+        lon = parts[5] if len(parts) > 5 else ""
+        lon_h = parts[6] if len(parts) > 6 else ""
+        spd = parts[7] if len(parts) > 7 else ""
+        dt = parts[9] if len(parts) > 9 else ""
+
+        out["status"] = status  # 'A' or 'V'
+        out["lat"] = nmea_dm_to_deg(lat, lat_h)
+        out["lon"] = nmea_dm_to_deg(lon, lon_h)
+        out["speed_knots"] = float(spd) if spd not in ("", None) else None
+        out["date_ddmmyy"] = dt if dt else None
+    except Exception:
+        pass
+    return out
+
+
+class GPSState:
+    def __init__(self):
+        self.lat = None
+        self.lon = None
+        self.alt_m = None
+        self.fix_quality = None
+        self.num_sats = None
+        self.hdop = None
+        self.speed_knots = None
+        self.status = None  # A/V
+        self.date_ddmmyy = None
+        self.last_sentence = None
+        self.last_update_unix = None
+
+    def update_from(self, d: dict):
+        for k, v in d.items():
+            if v is not None:
+                setattr(self, k, v)
+        self.last_update_unix = time.time()
+
+
+def init_gps_serial():
+    # Prevent gpsd from taking the UART (best-effort, no crash if absent)
+    os.system("sudo systemctl stop gpsd gpsd.socket 2>/dev/null")
+    try:
+        sp = serial.Serial(
+            GPS_PORT,
+            baudrate=GPS_BAUD,
+            timeout=GPS_READ_TIMEOUT_S,
+        )
+        return sp
+    except Exception as e:
+        print(f"[{now_iso_seconds()}] GPS serial open failed on {GPS_PORT}: {e}")
+        return None
+
+
+def poll_gps(gps_ser, gps_state: GPSState, max_lines: int = 25):
+    """
+    Read up to max_lines lines from UART (non-blocking-ish due to timeout),
+    parse GGA/RMC, and update state.
+    """
+    if gps_ser is None:
+        return
+
+    for _ in range(max_lines):
+        try:
+            raw = gps_ser.readline()
+        except serial.SerialException:
+            return
+        except Exception:
+            return
+
+        if not raw:
+            return
+
+        try:
+            line = raw.decode(errors="ignore").strip()
+        except Exception:
+            continue
+
+        if not line.startswith("$") or "*" not in line:
+            continue
+        if not nmea_checksum_ok(line):
+            continue
+
+        gps_state.last_sentence = line
+
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+
+        typ = parts[0][1:]  # e.g. GPGGA / GPRMC / GNGGA...
+        if typ.endswith("GGA"):
+            gps_state.update_from(parse_gga(parts))
+        elif typ.endswith("RMC"):
+            gps_state.update_from(parse_rmc(parts))
+
+
 CSV_HEADER = [
     "timestamp_iso",
     "unix_time_s",
+
+    # --- GPS (UART NMEA) ---
+    "gps_lat_deg",
+    "gps_lon_deg",
+    "gps_alt_m",
+    "gps_speed_knots",
+    "gps_fix_quality",
+    "gps_num_sats",
+    "gps_hdop",
+    "gps_status",
+    "gps_last_update_unix_s",
+
+    # --- Enviro+ ---
     "lux",
     "proximity",
     "temperature_C",
@@ -208,6 +410,7 @@ CSV_HEADER = [
     "noise_mid",
     "noise_high",
     "noise_total",
+
     # PMS5003 (blank if unavailable)
     "pm1_0_ug_m3",
     "pm2_5_ug_m3",
@@ -265,18 +468,10 @@ class Recorder:
 
 
 def _pms_value(pm, attr: str, size, atm_fallback: bool = False):
-    """
-    Tries to read PMS values across common pms5003 APIs:
-      - dict-like attribute: pm.pm_ug_per_m3[2.5] / .get(2.5)
-      - callable method: pm.pm_ug_per_m3(2.5) or pm.pm_ug_per_m3(2.5, True)
-      - separate atm attribute: pm.pm_ug_per_m3_atm(...)
-    Returns None if unavailable.
-    """
     x = getattr(pm, attr, None)
     if x is None:
         return None
 
-    # callable method
     if callable(x):
         try:
             if atm_fallback:
@@ -290,7 +485,6 @@ def _pms_value(pm, attr: str, size, atm_fallback: bool = False):
         except Exception:
             return None
 
-    # mapping / dict-like
     try:
         if hasattr(x, "get"):
             return x.get(size, None)
@@ -339,7 +533,7 @@ def read_all(env_noise, bme, pms):
     else:
         temp_comp = None
 
-    # Gas (resistance-like values)
+    # Gas
     try:
         g = gas.read_all()
         ox = getattr(g, "oxidising", None)
@@ -349,7 +543,7 @@ def read_all(env_noise, bme, pms):
     except Exception:
         ox = red = nh3 = adc = None
 
-    # Noise (may return zeros depending on setup)
+    # Noise
     try:
         nlow, nmid, nhigh, ntotal = env_noise.get_noise_profile()
     except Exception:
@@ -369,7 +563,6 @@ def read_all(env_noise, bme, pms):
             pm2_5 = _pms_value(pm, "pm_ug_per_m3", 2.5)
             pm10 = _pms_value(pm, "pm_ug_per_m3", 10)
 
-            # Prefer explicit *_atm attribute if present; otherwise try method fallback
             pm1_0_atm = _pms_value(pm, "pm_ug_per_m3_atm", 1.0) or _pms_value(pm, "pm_ug_per_m3", 1.0, atm_fallback=True)
             pm2_5_atm = _pms_value(pm, "pm_ug_per_m3_atm", 2.5) or _pms_value(pm, "pm_ug_per_m3", 2.5, atm_fallback=True)
             pm10_atm = _pms_value(pm, "pm_ug_per_m3_atm", 10) or _pms_value(pm, "pm_ug_per_m3", 10, atm_fallback=True)
@@ -418,16 +611,22 @@ def read_all(env_noise, bme, pms):
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = ensure_data_dir(script_dir)
+
     env_noise, bme, pms = init_sensors()
     display_ctx = init_display()
+
     shutdown_script = os.path.join(script_dir, "enviro_pi_shutdown_gesture.py")
     shutdown_proc = None
 
     recorder = Recorder(data_dir)
 
+    # GPS setup/state
+    gps_state = GPSState()
+    gps_ser = init_gps_serial()
+
     # Proximity gesture state
-    events = deque()     # timestamps of rising edges
-    close_state = False  # hysteresis state
+    events = deque()
+    close_state = False
 
     next_sample = time.time()
     last_status = None
@@ -437,6 +636,7 @@ def main():
         f"{GESTURE_WINDOW_S}s toggles recording."
     )
     print(f"[{now_iso_seconds()}] Data directory: {data_dir}")
+    print(f"[{now_iso_seconds()}] GPS: {GPS_PORT} @ {GPS_BAUD} (timeout={GPS_READ_TIMEOUT_S}s)")
 
     # Optional bypass: start recording immediately if requested.
     if _truthy_env("RECORD_ON_START") or os.path.exists(_record_flag_file(script_dir)):
@@ -450,6 +650,9 @@ def main():
 
     try:
         while True:
+            # Keep GPS state fresh regardless of recording state
+            poll_gps(gps_ser, gps_state, max_lines=25)
+
             # Poll proximity frequently for gesture detection
             try:
                 prox_val = ltr559.get_proximity()
@@ -463,7 +666,6 @@ def main():
             else:
                 if prox_val >= PROX_ON:
                     close_state = True
-                    # Rising edge -> count as a detection event
                     t = time.time()
                     events.append(t)
                     while events and (t - events[0]) > GESTURE_WINDOW_S:
@@ -489,9 +691,23 @@ def main():
             now = time.time()
             if recorder.is_recording and now >= next_sample:
                 s = read_all(env_noise, bme, pms)
+
                 row = [
                     now_iso_seconds(),
                     f"{now:.3f}",
+
+                    # GPS snapshot (may be blank if NO FIX / not parsed yet)
+                    safe_float(gps_state.lat),
+                    safe_float(gps_state.lon),
+                    safe_float(gps_state.alt_m),
+                    safe_float(gps_state.speed_knots),
+                    safe_int(gps_state.fix_quality),
+                    safe_int(gps_state.num_sats),
+                    safe_float(gps_state.hdop),
+                    safe_str(gps_state.status),
+                    safe_float(gps_state.last_update_unix),
+
+                    # Enviro+ sensors
                     safe_float(s["lux"]),
                     safe_float(s["prox"]),
                     safe_float(s["temp"]),
@@ -508,6 +724,8 @@ def main():
                     safe_float(s["nmid"]),
                     safe_float(s["nhigh"]),
                     safe_float(s["ntotal"]),
+
+                    # PMS5003
                     safe_float(s["pm1_0"]),
                     safe_float(s["pm2_5"]),
                     safe_float(s["pm10"]),
@@ -521,6 +739,7 @@ def main():
                     safe_float(s["pm5_0_count"]),
                     safe_float(s["pm10_count"]),
                 ]
+
                 recorder.write_row(row)
                 print(",".join(str(x) for x in row))
                 next_sample = now + SAMPLE_INTERVAL_S
@@ -532,6 +751,11 @@ def main():
     finally:
         recorder.stop()
         shutdown_proc = stop_shutdown_watcher(shutdown_proc)
+        try:
+            if gps_ser is not None:
+                gps_ser.close()
+        except Exception:
+            pass
         print(f"[{now_iso_seconds()}] Exited.")
 
 
