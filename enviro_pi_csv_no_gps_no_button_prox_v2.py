@@ -1,6 +1,7 @@
+```python
 #!/usr/bin/env python3
 """
-Enviro+ logger with GPS (UART NMEA), proximity gesture toggle, and optional shutdown-watcher.
+Enviro+ logger with GPS via gpsd (/dev/ttyACM0), proximity gesture toggle, and optional shutdown-watcher.
 
 Control:
 - Make 3 distinct "hand near" proximity events within 10 seconds to TOGGLE recording.
@@ -9,10 +10,13 @@ Control:
   * If not recording: start logging to a new CSV file (with headers)
   * If recording: stop logging (close the CSV file)
 
-GPS:
-- Reads raw NMEA from /dev/serial0 at 9600 baud (typical for GT-U7/NEO).
-- gpsd is proactively stopped to avoid UART contention.
-- Robust parsing: tolerates NO FIX, partial lines, and garbage bytes.
+GPS (USB via gpsd):
+- Uses gpsd as the single owner of the GPS device (e.g. /dev/ttyACM0).
+- This script reads position/time/quality from gpsd (no serial port contention).
+- Robust: tolerates NO FIX, missing fields, and temporary gpsd outages.
+
+Requirement (once):
+- sudo apt -y install python3-gps
 
 Notes:
 - Designed to run inside Pimoroni's recommended venv: source ~/.virtualenvs/pimoroni/bin/activate
@@ -29,7 +33,13 @@ import time
 from collections import deque
 from datetime import datetime
 
-import serial  # pyserial
+# gpsd client (Debian package: python3-gps)
+try:
+    import gps  # type: ignore
+    import select
+except Exception:
+    gps = None
+    select = None
 
 from enviroplus import gas, noise
 from smbus2 import SMBus
@@ -79,10 +89,10 @@ PROX_OFF = 150  # considered "far" again once dropping below this
 # Temperature compensation factor (from Enviro+ examples)
 TEMP_COMP_FACTOR = 2.25
 
-# GPS (UART)
-GPS_PORT = "/dev/serial0"
-GPS_BAUD = 9600
-GPS_READ_TIMEOUT_S = 1.0
+# GPSD polling
+GPSD_HOST = "127.0.0.1"
+GPSD_PORT = "2947"
+GPSD_MAX_MSGS_PER_LOOP = 25
 # -------------------------------------
 
 
@@ -112,8 +122,7 @@ def safe_str(x):
     if x is None:
         return ""
     try:
-        s = str(x)
-        return s
+        return str(x)
     except Exception:
         return ""
 
@@ -219,178 +228,153 @@ def stop_shutdown_watcher(proc):
     return None
 
 
-def nmea_checksum_ok(sentence: str) -> bool:
-    # sentence includes leading '$' and contains '*hh'
-    try:
-        if not sentence.startswith("$") or "*" not in sentence:
-            return False
-        body, cks = sentence[1:].split("*", 1)
-        cks = cks.strip()
-        if len(cks) < 2:
-            return False
-        want = int(cks[:2], 16)
-        got = 0
-        for ch in body:
-            got ^= ord(ch)
-        return got == want
-    except Exception:
-        return False
-
-
-def nmea_dm_to_deg(dm: str, hemi: str):
-    # dm like "ddmm.mmmm" or "dddmm.mmmm"
-    try:
-        if dm is None or dm == "":
-            return None
-        if "." not in dm:
-            return None
-        # minutes are last two digits of the integer part (before decimal) plus fractional
-        # so split degrees/minutes by length: degrees = all but last 2 of integer part
-        ip = dm.split(".", 1)[0]
-        if len(ip) < 3:
-            return None
-        deg_part = ip[:-2]
-        min_part = dm[len(deg_part):]
-        deg = float(deg_part)
-        minutes = float(min_part)
-        val = deg + minutes / 60.0
-        if hemi in ("S", "W"):
-            val = -val
-        return val
-    except Exception:
-        return None
-
-
-def parse_gga(parts):
-    # $GPGGA,time,lat,N,lon,E,fix,numsats,hdop,alt,M,geoid,M,...
-    out = {}
-    try:
-        fix_q = parts[6] if len(parts) > 6 else ""
-        sats = parts[7] if len(parts) > 7 else ""
-        hdop = parts[8] if len(parts) > 8 else ""
-        alt = parts[9] if len(parts) > 9 else ""
-        out["fix_quality"] = int(fix_q) if fix_q.isdigit() else None
-        out["num_sats"] = int(sats) if sats.isdigit() else None
-        out["hdop"] = float(hdop) if hdop not in ("", None) else None
-        out["alt_m"] = float(alt) if alt not in ("", None) else None
-    except Exception:
-        pass
-    return out
-
-
-def parse_rmc(parts):
-    # $GPRMC,time,status,lat,N,lon,E,speed_knots,course,date,...
-    out = {}
-    try:
-        status = parts[2] if len(parts) > 2 else ""
-        lat = parts[3] if len(parts) > 3 else ""
-        lat_h = parts[4] if len(parts) > 4 else ""
-        lon = parts[5] if len(parts) > 5 else ""
-        lon_h = parts[6] if len(parts) > 6 else ""
-        spd = parts[7] if len(parts) > 7 else ""
-        dt = parts[9] if len(parts) > 9 else ""
-
-        out["status"] = status  # 'A' or 'V'
-        out["lat"] = nmea_dm_to_deg(lat, lat_h)
-        out["lon"] = nmea_dm_to_deg(lon, lon_h)
-        out["speed_knots"] = float(spd) if spd not in ("", None) else None
-        out["date_ddmmyy"] = dt if dt else None
-    except Exception:
-        pass
-    return out
-
-
 class GPSState:
+    """
+    Snapshot state (always "latest we have from gpsd").
+    When writing a row, we just take the current snapshot -> effectively "closest timestamp".
+    """
     def __init__(self):
         self.lat = None
         self.lon = None
         self.alt_m = None
-        self.fix_quality = None
-        self.num_sats = None
-        self.hdop = None
-        self.speed_knots = None
-        self.status = None  # A/V
-        self.date_ddmmyy = None
-        self.last_sentence = None
-        self.last_update_unix = None
+        self.speed_m_s = None
+        self.track_deg = None
 
-    def update_from(self, d: dict):
-        for k, v in d.items():
-            if v is not None:
-                setattr(self, k, v)
+        self.mode = None  # 0/1/2/3 (no fix, 2D, 3D)
+        self.hdop = None
+        self.vdop = None
+        self.pdop = None
+
+        self.num_sats_visible = None
+        self.num_sats_used = None
+
+        self.gps_time_iso = None  # gpsd TPV time (UTC ISO8601) if present
+        self.last_update_unix = None  # system time when we updated from gpsd
+
+    def mark_updated(self):
         self.last_update_unix = time.time()
 
 
-def init_gps_serial():
-    # Prevent gpsd from taking the UART (best-effort, no crash if absent)
-    os.system("sudo systemctl stop gpsd gpsd.socket 2>/dev/null")
-    try:
-        sp = serial.Serial(
-            GPS_PORT,
-            baudrate=GPS_BAUD,
-            timeout=GPS_READ_TIMEOUT_S,
-        )
-        return sp
-    except Exception as e:
-        print(f"[{now_iso_seconds()}] GPS serial open failed on {GPS_PORT}: {e}")
-        return None
+class GPSDClient:
+    def __init__(self, host: str, port: str):
+        self.host = host
+        self.port = port
+        self.session = None
+        self.ok = False
+        self.last_err = None
 
-
-def poll_gps(gps_ser, gps_state: GPSState, max_lines: int = 25):
-    """
-    Read up to max_lines lines from UART (non-blocking-ish due to timeout),
-    parse GGA/RMC, and update state.
-    """
-    if gps_ser is None:
-        return
-
-    for _ in range(max_lines):
+    def connect(self):
+        if gps is None or select is None:
+            self.last_err = "python3-gps not available (import gps failed)"
+            self.ok = False
+            return False
         try:
-            raw = gps_ser.readline()
-        except serial.SerialException:
+            s = gps.gps(host=self.host, port=self.port)
+            s.stream(gps.WATCH_ENABLE | gps.WATCH_NEWSTYLE)
+            self.session = s
+            self.ok = True
+            self.last_err = None
+            return True
+        except Exception as e:
+            self.session = None
+            self.ok = False
+            self.last_err = str(e)
+            return False
+
+    def poll_into(self, state: GPSState, max_msgs: int = 25):
+        """
+        Non-blocking poll: read up to max_msgs waiting reports from gpsd and update state.
+        If connection drops, we degrade silently and try reconnect occasionally.
+        """
+        if not self.ok or self.session is None:
             return
-        except Exception:
-            return
 
-        if not raw:
-            return
+        # If gpsd is quiet, select() returns immediately.
+        for _ in range(max_msgs):
+            try:
+                r, _, _ = select.select([self.session.sock], [], [], 0)
+                if not r:
+                    return
 
-        try:
-            line = raw.decode(errors="ignore").strip()
-        except Exception:
-            continue
+                report = self.session.next()
+                if not isinstance(report, dict):
+                    # python-gps sometimes returns objects; try dict-like fallback
+                    try:
+                        report = dict(report)
+                    except Exception:
+                        continue
 
-        if not line.startswith("$") or "*" not in line:
-            continue
-        if not nmea_checksum_ok(line):
-            continue
+                cls = report.get("class", "")
+                if cls == "TPV":
+                    # TPV: lat/lon/alt/speed/track/time/mode...
+                    if "lat" in report:
+                        state.lat = report.get("lat")
+                    if "lon" in report:
+                        state.lon = report.get("lon")
+                    if "alt" in report:
+                        state.alt_m = report.get("alt")
+                    if "speed" in report:
+                        state.speed_m_s = report.get("speed")  # m/s
+                    if "track" in report:
+                        state.track_deg = report.get("track")
+                    if "mode" in report:
+                        state.mode = report.get("mode")
+                    if "time" in report:
+                        state.gps_time_iso = report.get("time")
 
-        gps_state.last_sentence = line
+                    state.mark_updated()
 
-        parts = line.split(",")
-        if len(parts) < 2:
-            continue
+                elif cls == "SKY":
+                    # SKY: satellites list, used/visible counts, hdop/vdop/pdop...
+                    sats = report.get("satellites", None)
+                    if isinstance(sats, list):
+                        state.num_sats_visible = len(sats)
+                        used = 0
+                        for s in sats:
+                            try:
+                                if s.get("used"):
+                                    used += 1
+                            except Exception:
+                                pass
+                        state.num_sats_used = used
 
-        typ = parts[0][1:]  # e.g. GPGGA / GPRMC / GNGGA...
-        if typ.endswith("GGA"):
-            gps_state.update_from(parse_gga(parts))
-        elif typ.endswith("RMC"):
-            gps_state.update_from(parse_rmc(parts))
+                    if "hdop" in report:
+                        state.hdop = report.get("hdop")
+                    if "vdop" in report:
+                        state.vdop = report.get("vdop")
+                    if "pdop" in report:
+                        state.pdop = report.get("pdop")
+
+                    state.mark_updated()
+
+            except StopIteration:
+                # gpsd socket ended
+                self.ok = False
+                self.last_err = "gpsd stream ended"
+                return
+            except Exception as e:
+                self.ok = False
+                self.last_err = str(e)
+                return
 
 
 CSV_HEADER = [
     "timestamp_iso",
     "unix_time_s",
 
-    # --- GPS (UART NMEA) ---
+    # --- GPS (via gpsd) ---
     "gps_lat_deg",
     "gps_lon_deg",
     "gps_alt_m",
-    "gps_speed_knots",
-    "gps_fix_quality",
-    "gps_num_sats",
+    "gps_speed_m_s",
+    "gps_track_deg",
+    "gps_mode",
     "gps_hdop",
-    "gps_status",
+    "gps_vdop",
+    "gps_pdop",
+    "gps_sats_visible",
+    "gps_sats_used",
+    "gps_time_iso",
     "gps_last_update_unix_s",
 
     # --- Enviro+ ---
@@ -620,9 +604,11 @@ def main():
 
     recorder = Recorder(data_dir)
 
-    # GPS setup/state
+    # GPSD setup/state
     gps_state = GPSState()
-    gps_ser = init_gps_serial()
+    gpsd = GPSDClient(GPSD_HOST, GPSD_PORT)
+    gpsd.connect()
+    last_gpsd_reconnect_try = 0.0
 
     # Proximity gesture state
     events = deque()
@@ -636,7 +622,10 @@ def main():
         f"{GESTURE_WINDOW_S}s toggles recording."
     )
     print(f"[{now_iso_seconds()}] Data directory: {data_dir}")
-    print(f"[{now_iso_seconds()}] GPS: {GPS_PORT} @ {GPS_BAUD} (timeout={GPS_READ_TIMEOUT_S}s)")
+    if gps is None:
+        print(f"[{now_iso_seconds()}] GPSD: disabled (python3-gps missing). Install: sudo apt -y install python3-gps")
+    else:
+        print(f"[{now_iso_seconds()}] GPSD: {GPSD_HOST}:{GPSD_PORT} (connected={gpsd.ok})")
 
     # Optional bypass: start recording immediately if requested.
     if _truthy_env("RECORD_ON_START") or os.path.exists(_record_flag_file(script_dir)):
@@ -650,8 +639,16 @@ def main():
 
     try:
         while True:
-            # Keep GPS state fresh regardless of recording state
-            poll_gps(gps_ser, gps_state, max_lines=25)
+            # Keep GPS snapshot fresh regardless of recording state.
+            if gps is not None:
+                if not gpsd.ok:
+                    # Try reconnect every ~5s
+                    now_r = time.time()
+                    if (now_r - last_gpsd_reconnect_try) > 5.0:
+                        last_gpsd_reconnect_try = now_r
+                        gpsd.connect()
+                if gpsd.ok:
+                    gpsd.poll_into(gps_state, max_msgs=GPSD_MAX_MSGS_PER_LOOP)
 
             # Poll proximity frequently for gesture detection
             try:
@@ -696,15 +693,19 @@ def main():
                     now_iso_seconds(),
                     f"{now:.3f}",
 
-                    # GPS snapshot (may be blank if NO FIX / not parsed yet)
+                    # GPS snapshot from gpsd (blank if no fix / not yet available)
                     safe_float(gps_state.lat),
                     safe_float(gps_state.lon),
                     safe_float(gps_state.alt_m),
-                    safe_float(gps_state.speed_knots),
-                    safe_int(gps_state.fix_quality),
-                    safe_int(gps_state.num_sats),
+                    safe_float(gps_state.speed_m_s),
+                    safe_float(gps_state.track_deg),
+                    safe_int(gps_state.mode),
                     safe_float(gps_state.hdop),
-                    safe_str(gps_state.status),
+                    safe_float(gps_state.vdop),
+                    safe_float(gps_state.pdop),
+                    safe_int(gps_state.num_sats_visible),
+                    safe_int(gps_state.num_sats_used),
+                    safe_str(gps_state.gps_time_iso),
                     safe_float(gps_state.last_update_unix),
 
                     # Enviro+ sensors
@@ -751,13 +752,9 @@ def main():
     finally:
         recorder.stop()
         shutdown_proc = stop_shutdown_watcher(shutdown_proc)
-        try:
-            if gps_ser is not None:
-                gps_ser.close()
-        except Exception:
-            pass
         print(f"[{now_iso_seconds()}] Exited.")
 
 
 if __name__ == "__main__":
     main()
+```
