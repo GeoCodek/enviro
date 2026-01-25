@@ -28,7 +28,25 @@ from datetime import datetime
 
 from enviroplus import gas, noise
 from smbus2 import SMBus
-from bme280 import BME280
+# --- BME280 import (robust across packaging variants) ---
+try:
+    # classic Pimoroni layout expected by many Enviro+ examples
+    from bme280 import BME280  # type: ignore
+except Exception:
+    try:
+        # some installs expose a different module name
+        from pimoroni_bme280 import BME280  # type: ignore
+    except Exception:
+        try:
+            # last resort: package folder might be named "pimoroni_bme280"
+            import importlib
+            _m = importlib.import_module("pimoroni_bme280")
+            BME280 = getattr(_m, "BME280")
+        except Exception as e:
+            raise ImportError(
+                "Cannot import BME280. Your installed pimoroni-bme280 does not expose "
+                "a compatible module name. Run the diagnostics (ls/pkgutil/grep) to see the real module."
+            ) from e
 
 # LTR559 (proximity + light)
 try:
